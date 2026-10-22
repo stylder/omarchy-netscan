@@ -63,6 +63,24 @@ On Arch, the only one usually worth installing is netcat:
 sudo pacman -S netcat-openbsd
 ```
 
+## Removing it
+
+```sh
+omarchy plugin remove stylder.netscan
+```
+
+That takes the plugin out of `~/.config/omarchy/plugins/` and from the bar
+layout. Two things can be left behind, both harmless, and both removed by
+hand:
+
+```sh
+rm -f ~/.local/state/omarchy/netscan.json   # the scan cache
+rm -f ~/.local/bin/netscan                  # only if you linked it there
+```
+
+The menu entries in `~/.config/omarchy/extensions/omarchy-menu.jsonc` are
+yours to delete.
+
 ## Using it
 
 - **Left-click** the bar icon to open the device list.
