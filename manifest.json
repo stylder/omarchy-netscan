@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "stylder.netscan",
+  "name": "Network Scan",
+  "version": "1.0.0",
+  "author": "stylder",
+  "license": "MIT",
+  "description": "Fing-style LAN discovery in the bar: the devices on your network by name, and the open ports of each one.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Network Scan",
+    "description": "Discover the devices on your LAN, Fing-style: name, IP, MAC, vendor, and open ports",
+    "category": "Network",
+    "aliases": ["network", "netscan", "lan", "ports", "fing"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 120
+    },
+    "schema": [
+      { "key": "refreshSeconds", "type": "integer", "label": "Refresh interval (seconds)", "min": 30, "max": 3600, "step": 30, "defaultValue": 120 }
+    ]
+  }
+}

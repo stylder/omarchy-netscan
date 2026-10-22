@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# netscan — discover devices on the local LAN, Fing-style.
+#
+# Discovery is a parallel ICMP sweep over the interface's subnet, which
+# populates the kernel neighbour table; MAC addresses then come from that
+# table. Names come from mDNS/Avahi (what Fing shows for most consumer gear)
+# falling back to reverse DNS. Vendor lookup uses nmap's OUI database when
+# nmap is installed, and is skipped otherwise.
+#
+# Nothing here needs root: ping is setuid and the neighbour table is readable.
+#
+# This script ships with the omarchy-netscan plugin and works on its own:
+# it only needs ping, ip, nc and getent, all of which are on a normal
+# desktop. Install it on your PATH if you want to run it by hand.
+#
+# Usage: netscan [--json] [--iface IFACE] [--timeout SECONDS]
+#        netscan --ports IP [--full] [--json]
+#
+# --ports scans one host's TCP ports (a connect scan, so no root either) and
+# names each hit via getent services. --full scans all 65535 instead of the
+# common set.
+
+set -uo pipefail
+
+JSON=0
+IFACE=""
+TIMEOUT=1
+PORTS_IP=""
+FULL=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON=1 ;;
+    --ports) PORTS_IP="${2:-}"; shift ;;
+    --full) FULL=1 ;;
+    --iface) IFACE="${2:-}"; shift ;;
+    --timeout) TIMEOUT="${2:-}"; shift ;;
+    -h|--help)
+      sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) echo "netscan: unknown option '$1'" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---- port scan mode ---------------------------------------------------
+
+# A TCP connect scan: the kernel completes the handshake, so this works as an
+# ordinary user. It is slower than a SYN scan and leaves a connection in the
+# peer's log, but it needs neither root nor raw sockets, and it is fast
+# enough in parallel to be usable interactively.
+if [[ -n "$PORTS_IP" ]]; then
+  command -v nc >/dev/null 2>&1 || {
+    echo "netscan: nc (netcat) is required for --ports" >&2; exit 1; }
+
+  if (( FULL )); then
+    PORTS="$(seq 1 65535)"
+    PARALLEL=256
+  else
+    # The ports a consumer device is actually likely to answer on. A full
+    # 65535 sweep is one flag away for the times that matters.
+    PORTS="21 22 23 25 53 67 68 69 80 81 88 110 111 123 135 137 138 139 143 161 162 179
+           389 443 445 464 465 514 515 548 554 587 631 636 873 993 995
+           1080 1433 1434 1521 1723 1900 2049 2222 2375 2376 3000 3128 3268 3269
+           3306 3389 3690 4000 4443 4567 4840 5000 5001 5060 5222 5353 5432 5555
+           5601 5672 5900 5985 5986 6000 6379 6443 6667 6697 7000 7001 7077 7443
+           8000 8001 8008 8009 8080 8081 8088 8090 8118 8123 8181 8443 8500 8888
+           9000 9001 9090 9100 9200 9300 9418 9999 10000 11211 15672 27017 28017
+           32400 49152 50000"
+    PARALLEL=64
+  fi
+
+  # Nanosecond resolution: a common-port sweep finishes in about a second,
+  # so whole-second %s would report "0 ms".
+  SCAN_START="$(date +%s%3N)"
+
+  # xargs runs the probes concurrently; each nc returns instantly on a
+  # refused connection, so the wall clock is dominated by silent timeouts.
+  # The port list is split on whitespace on purpose, and the address is
+  # spliced into the probe script for the same reason: one nc per port.
+  # shellcheck disable=SC2086
+  OPEN="$(printf '%s\n' $PORTS |
+    # shellcheck disable=SC2016
+    xargs -P"$PARALLEL" -I{} sh -c \
+      'nc -z -w1 "'"$PORTS_IP"'" {} >/dev/null 2>&1 && echo {}' 2>/dev/null |
+    sort -n)"
+
+  SCAN_MS=$(( $(date +%s%3N) - SCAN_START ))
+
+  if (( JSON )); then
+    printf '{"ip":"%s","ports":[' "$PORTS_IP"
+    sep=""
+    while read -r port; do
+      [[ -n "$port" ]] || continue
+      service="$(getent services "$port/tcp" 2>/dev/null | awk '{print $1}')"
+      printf '%s{"port":%d,"service":"%s"}' "$sep" "$port" "$service"
+      sep=","
+    done <<<"$OPEN"
+    printf '],"elapsed_ms":%d,"scanned":%s}\n' "$SCAN_MS" \
+      "$((( FULL )) && echo 65535 || echo "$(wc -w <<<"$PORTS")")"
+    exit 0
+  fi
+
+  BOLD=$'\e[1m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+  if [[ ! -t 1 ]]; then BOLD=""; DIM=""; RESET=""; fi
+
+  COUNT="$(grep -c . <<<"$OPEN" || true)"
+  printf '%s%s%s  %s(%s puertos abiertos en %s ms)%s\n' \
+    "$BOLD" "$PORTS_IP" "$RESET" "$DIM" "$COUNT" "$SCAN_MS" "$RESET"
+
+  if [[ "$COUNT" -eq 0 ]]; then
+    printf '  %sSin puertos TCP abiertos%s\n' "$DIM" "$RESET"
+    exit 0
+  fi
+
+  printf '\n'
+  while read -r port; do
+    [[ -n "$port" ]] || continue
+    service="$(getent services "$port/tcp" 2>/dev/null | awk '{print $1}')"
+    printf '  %-6s %s%s%s\n' "$port" "${DIM:-}" "${service:-unknown}" "$RESET"
+  done <<<"$OPEN"
+
+  exit 0
+fi
+
+# ---- interface + subnet ------------------------------------------------
+
+if [[ -z "$IFACE" ]]; then
+  IFACE="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')"
+fi
+[[ -n "$IFACE" ]] || { echo "netscan: no default route; pass --iface" >&2; exit 1; }
+
+CIDR="$(ip -o -4 addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')"
+[[ -n "$CIDR" ]] || { echo "netscan: $IFACE has no IPv4 address" >&2; exit 1; }
+
+BASE="${CIDR%/*}"
+BASE="${BASE%.*}"
+BITS="${CIDR#*/}"
+# The network address is the host IP with its host bits cleared; awk does
+# the masking so the header prints 192.168.0.0/24, not the local address.
+NET="$(awk -v ip="${CIDR%/*}" -v bits="$BITS" 'BEGIN{
+  split(ip, o, ".")
+  for (i = 1; i <= 4; i++) {
+    keep = (i == 4) ? bits - 24 : 8
+    if (keep < 0) keep = 0
+    if (keep > 8) keep = 8
+    out[i] = int(o[i] / (2 ** (8 - keep))) * (2 ** (8 - keep))
+  }
+  printf "%d.%d.%d.%d", out[1], out[2], out[3], out[4]
+}')"
+LAST=254
+[[ "$BITS" -le 16 ]] && LAST=65534
+
+MY_IP="${CIDR%/*}"
+SNAPSHOT="$(mktemp)"
+trap 'rm -f "$SNAPSHOT"' EXIT
+
+# Hosts .0 (network) and .255 (broadcast) are never devices; on a /31 or
+# /32 there is no sweep at all and we read the neighbour table as-is.
+SWEEP=1
+if (( BITS >= 31 )); then SWEEP=0; fi
+
+# ---- sweep -------------------------------------------------------------
+
+if (( SWEEP )); then
+  # Devices that ignore ICMP never create a fresh neighbour entry, so the
+  # table as it stood before this sweep is the only record of them. Keep a
+  # copy and merge it back in afterwards, or the result would shrink from one
+  # run to the next purely because a phone was asleep.
+  ip neigh show dev "$IFACE" 2>/dev/null > "$SNAPSHOT"
+
+  if (( LAST > 512 )); then
+    PROCS=256; STEP=2
+  else
+    PROCS=64; STEP=1
+  fi
+
+  for (( start=1; start<=LAST; start+=PROCS )); do
+    for (( i=start; i<start+PROCS && i<=LAST; i+=STEP )); do
+      ping -c1 -W"$TIMEOUT" "$BASE.$i" >/dev/null 2>&1 &
+    done
+    wait
+  done
+fi
+
+# ---- MAC -> host -------------------------------------------------------
+
+# Avahi knows consumer names ("PS5-A1117F", "MacBook-Pro-de-Santiago") that
+# reverse DNS usually does not, so it is the primary source and PTR the
+# fallback. avahi-resolve-address is queried per host rather than parsed out
+# of avahi-browse: browse's reverse mode prints the resolved name in place of
+# the address, so there is nothing to key the mapping by.
+resolve_name() {
+  local ip="$1" out=""
+  if command -v avahi-resolve-address >/dev/null 2>&1; then
+    out="$(timeout 2 avahi-resolve-address -4 "$ip" 2>/dev/null |
+      awk -F'\t' 'NR == 1 { print $2 }')"
+    out="${out%.local}"
+  fi
+  if [[ -z "$out" ]]; then
+    out="$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -1)"
+    out="${out%% *}"
+  fi
+  [[ "$out" == "$ip" ]] && out=""
+  printf '%s' "$out"
+}
+
+# ---- OUI vendor table -------------------------------------------------
+
+# nmap ships the OUI database; without it we simply omit the vendor
+# column rather than guessing from the locally-administered bit.
+OUI_DB=""
+for candidate in /usr/share/nmap/nmap-mac-prefixes /usr/share/wireshark/manuf; do
+  [[ -r "$candidate" ]] && { OUI_DB="$candidate"; break; }
+done
+
+vendor_for() {
+  local mac="$1" oui
+  [[ -n "$OUI_DB" ]] || { printf ''; return; }
+  oui="$(printf '%s' "$mac" | tr -d ':-' | tr 'a-f' 'A-F' | cut -c1-6)"
+  # nmap's file is "FC0000 Vendor"; wireshark's is "00:00:00\tVendor".
+  if [[ "$OUI_DB" == *manuf ]]; then
+    awk -F'\t' -v o="$oui" 'toupper($1)==o {print $2; exit}' "$OUI_DB"
+  else
+    awk -v o="$oui" 'substr($1,1,6)==o {$1="";sub(/^ /,"");print;exit}' "$OUI_DB"
+  fi
+}
+
+# ---- collect -----------------------------------------------------------
+
+SELF_MAC=""
+SELF_HOST="$(hostname 2>/dev/null)"
+
+# Rows carry a unit-separator rather than a tab: bash folds runs of IFS
+# whitespace, so a tab-joined row with an empty vendor column collapses and
+# shifts every later field on the way back out.
+SEP=$'\x1f'
+
+ROWS=()
+# `ip neigh` prints "IP dev IFACE lladdr MAC STATE [flags]", but the lladdr
+# field is absent for FAILED/INCOMPLETE entries, so awk reads by key rather
+# than by column -- otherwise a failed probe shifts every later field.
+# The pre-sweep snapshot is read first so a device the fresh sweep failed to
+# wake still contributes its MAC; the post-sweep table wins on conflicts.
+NEIGH="$(mktemp)"
+trap 'rm -f "$SNAPSHOT" "$NEIGH"' EXIT
+{
+  ip neigh show dev "$IFACE" 2>/dev/null
+  cat "$SNAPSHOT" 2>/dev/null
+} | awk '
+  !($0 ~ /(FAILED|INCOMPLETE|INVALID)/) {
+    ip = ""; mac = ""; state = ""
+    for (i = 1; i <= NF; i++) {
+      if ($i == "lladdr" && i < NF) mac = $(i + 1)
+      else if ($i ~ /^(REACHABLE|STALE|DELAY|PROBE|PERMANENT|NOARP)$/) state = $i
+    }
+    print $1, (mac == "" ? "-" : mac), (state == "" ? "STALE" : state)
+  }' | sort -u -k1,1 > "$NEIGH"
+
+declare -A MAC_OF=() STATE_OF=()
+IPS=()
+while read -r ip lladdr state; do
+  [[ -n "$lladdr" ]] || continue
+  [[ "$ip" == "$MY_IP" ]] && { SELF_MAC="$lladdr"; continue; }
+  # DELAY and PROBE are healthy states -- the kernel uses them for entries it
+  # has just resolved but plans to revalidate -- so only the outright
+  # failures are dropped here. They were already filtered upstream too.
+  case "$state" in FAILED|INCOMPLETE|INVALID) continue ;; esac
+
+  MAC_OF["$ip"]="$lladdr"
+  STATE_OF["$ip"]="$state"
+  IPS+=("$ip")
+done < "$NEIGH"
+
+# Resolve every host concurrently: each mDNS query can take up to its
+# timeout, and doing them in series would make a busy LAN crawl.
+NAME_CACHE="$(mktemp -d)"
+trap 'rm -f "$SNAPSHOT" "$NEIGH"; rm -rf "$NAME_CACHE"' EXIT
+for ip in "${IPS[@]}"; do
+  resolve_name "$ip" > "$NAME_CACHE/$ip" &
+done
+wait
+
+ROWS=()
+for ip in "${IPS[@]}"; do
+  name="$(cat "$NAME_CACHE/$ip" 2>/dev/null)"
+  ROWS+=("$ip$SEP${MAC_OF[$ip]}$SEP$name$SEP$(vendor_for "${MAC_OF[$ip]}")$SEP${STATE_OF[$ip]}")
+done
+rm -rf "$NAME_CACHE"
+
+# Sort by IP numerically: the kernel lists neighbours in arrival order.
+# awk does the comparison because the separator is not a dot.
+mapfile -t ROWS < <(printf '%s\n' "${ROWS[@]}" |
+  awk -v sep="$SEP" '{
+    split($0, f, sep)
+    split(f[1], o, ".")
+    printf "%d.%03d.%03d.%03d\t%s\n", o[1], o[2], o[3], o[4], $0
+  }' | sort -t$'\t' -k1,1 | cut -f2-)
+
+COUNT="${#ROWS[@]}"
+
+# ---- output ------------------------------------------------------------
+
+if (( JSON )); then
+  printf '{"iface":"%s","network":"%s","count":%d,"self":{"ip":"%s","mac":"%s","host":"%s"},"devices":[' \
+    "$IFACE" "$NET" "$COUNT" "$MY_IP" "$SELF_MAC" "$SELF_HOST"
+  sep=""
+  for row in "${ROWS[@]}"; do
+    IFS="$SEP" read -r ip mac name vendor state <<<"$row"
+    printf '%s{"ip":"%s","mac":"%s","name":"%s","vendor":"%s","state":"%s"}' \
+      "$sep" "$ip" "$mac" "$name" "$vendor" "$state"
+    sep=","
+  done
+  printf ']}\n'
+  exit 0
+fi
+
+BOLD=$'\e[1m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+if [[ ! -t 1 ]]; then BOLD=""; DIM=""; RESET=""; fi
+
+printf '%sLAN %s%s  %s%s%s  %s(%s dispositivos)%s\n' \
+  "$BOLD" "$NET" "$RESET" "$DIM" "$IFACE" "$RESET" "$DIM" "$COUNT" "$RESET"
+
+if (( COUNT == 0 )); then
+  printf '%s  Sin dispositivos%s\n' "$DIM" "$RESET"
+  exit 0
+fi
+
+printf '\n'
+for row in "${ROWS[@]}"; do
+  IFS="$SEP" read -r ip mac name vendor state <<<"$row"
+  printf '  %-15s %-17s %-24s %s\n' "$ip" "$mac" "${name:-${DIM}—${RESET}}" "${vendor:-${DIM}—${RESET}}"
+done
+
+printf '\n  %s%-15s %-17s %-24s%s  %s(tu)%s\n' \
+  "$DIM" "$MY_IP" "$SELF_MAC" "$SELF_HOST" "$RESET" "$DIM" "$RESET"

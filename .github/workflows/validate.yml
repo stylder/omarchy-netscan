@@ -1,0 +1,30 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the tools the checks need
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+
+      - name: Validate the manifest against the Omarchy plugin schema
+        run: ./scripts/validate-manifest.sh .
+
+      - name: Syntax check the scanner
+        run: bash -n bin/netscan
+
+      - name: Lint the scanner
+        run: shellcheck bin/netscan
+
+      - name: Smoke test the scanner
+        run: bin/netscan --help
