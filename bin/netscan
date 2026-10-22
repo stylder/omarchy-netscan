@@ -55,21 +55,24 @@ if [[ -n "$PORTS_IP" ]]; then
     echo "netscan: nc (netcat) is required for --ports" >&2; exit 1; }
 
   if (( FULL )); then
-    PORTS="$(seq 1 65535)"
+    mapfile -t PORTS < <(seq 1 65535)
     PARALLEL=256
   else
     # The ports a consumer device is actually likely to answer on. A full
     # 65535 sweep is one flag away for the times that matters.
-    PORTS="21 22 23 25 53 67 68 69 80 81 88 110 111 123 135 137 138 139 143 161 162 179
-           389 443 445 464 465 514 515 548 554 587 631 636 873 993 995
-           1080 1433 1434 1521 1723 1900 2049 2222 2375 2376 3000 3128 3268 3269
-           3306 3389 3690 4000 4443 4567 4840 5000 5001 5060 5222 5353 5432 5555
-           5601 5672 5900 5985 5986 6000 6379 6443 6667 6697 7000 7001 7077 7443
-           8000 8001 8008 8009 8080 8081 8088 8090 8118 8123 8181 8443 8500 8888
-           9000 9001 9090 9100 9200 9300 9418 9999 10000 11211 15672 27017 28017
-           32400 49152 50000"
+    PORTS=(
+      21 22 23 25 53 67 68 69 80 81 88 110 111 123 135 137 138 139 143 161 162 179
+      389 443 445 464 465 514 515 548 554 587 631 636 873 993 995
+      1080 1433 1434 1521 1723 1900 2049 2222 2375 2376 3000 3128 3268 3269
+      3306 3389 3690 4000 4443 4567 4840 5000 5001 5060 5222 5353 5432 5555
+      5601 5672 5900 5985 5986 6000 6379 6443 6667 6697 7000 7001 7077 7443
+      8000 8001 8008 8009 8080 8081 8088 8090 8118 8123 8181 8443 8500 8888
+      9000 9001 9090 9100 9200 9300 9418 9999 10000 11211 15672 27017 28017
+      32400 49152 50000
+    )
     PARALLEL=64
   fi
+  SCANNED="${#PORTS[@]}"
 
   # Nanosecond resolution: a common-port sweep finishes in about a second,
   # so whole-second %s would report "0 ms".
@@ -77,11 +80,9 @@ if [[ -n "$PORTS_IP" ]]; then
 
   # xargs runs the probes concurrently; each nc returns instantly on a
   # refused connection, so the wall clock is dominated by silent timeouts.
-  # The port list is split on whitespace on purpose, and the address is
-  # spliced into the probe script for the same reason: one nc per port.
-  # shellcheck disable=SC2086
-  OPEN="$(printf '%s\n' $PORTS |
-    # shellcheck disable=SC2016
+  # The address is spliced into the probe script so each probe gets its own
+  # nc, and the port list is one argument per line.
+  OPEN="$(printf '%s\n' "${PORTS[@]}" |
     xargs -P"$PARALLEL" -I{} sh -c \
       'nc -z -w1 "'"$PORTS_IP"'" {} >/dev/null 2>&1 && echo {}' 2>/dev/null |
     sort -n)"
@@ -97,8 +98,7 @@ if [[ -n "$PORTS_IP" ]]; then
       printf '%s{"port":%d,"service":"%s"}' "$sep" "$port" "$service"
       sep=","
     done <<<"$OPEN"
-    printf '],"elapsed_ms":%d,"scanned":%s}\n' "$SCAN_MS" \
-      "$((( FULL )) && echo 65535 || echo "$(wc -w <<<"$PORTS")")"
+    printf '],"elapsed_ms":%d,"scanned":%s}\n' "$SCAN_MS" "$SCANNED"
     exit 0
   fi
 
